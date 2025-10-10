@@ -1,0 +1,185 @@
+jenkins pipeline code... deployement vagerah sab
+// Global map for Slack notification colors
+def COLOR_MAP = [
+    'SUCCESS' : 'good',
+    'FAILURE' : 'danger',
+    'UNSTABLE': 'warning',
+    'ABORTED' : 'danger',
+]
+def dockerImage
+pipeline {
+    agent any
+
+    tools {
+        maven "Maven3.9"
+        jdk "JDK17"
+    }
+
+    environment {
+        registryCredential="ecr:ap-south-1:awscreds"
+        imageName="138576548682.dkr.ecr.ap-south-1.amazonaws.com/vprofileapp"
+        vprofileRegistry="https://138576548682.dkr.ecr.ap-south-1.amazonaws.com"
+        // Your Nexus Credentials
+        NEXUS_VERSION = "nexus3"
+        NEXUS_PROTOCOL = 'http'
+        NEXUS_URL = "52.66.36.191:8081"
+        NEXUS_REPOSITORY = "javaa_profile-repo"
+        NEXUS_CREDENTIALS_ID = 'nexuslog'
+        ARTVERSION="${env.BUILD_ID}"
+        cluster='Vprofile'
+        service='vprofileapptask-service'
+    }
+
+    stages {
+        stage("Fetch code from github") {
+            steps {
+                echo "--------- Fetching code from Github ----------"
+                git branch: 'main', url: 'https://github.com/Ankitkhan08/vprofile-project.git'
+            }
+        }
+        stage("Maven Unit Test") {
+            steps {
+                echo "--------- Running Unit Test ----------"
+                sh 'mvn test'
+            }
+        }
+        stage("Code Build") {
+            steps {
+                echo "--------- Code is Built ----------"
+                sh 'mvn clean install'
+                script {
+                    echo "--------- Renaming artifact to ROOT.war ----------"
+                    def warFile = findFiles(glob: 'target/*.war')[0]
+                    sh "mv ${warFile.path} target/ROOT.war"
+                }
+            }
+            post {
+                success {
+                    echo "--------- Built successfully & Archived ----------"
+                    archiveArtifacts artifacts: 'target/ROOT.war'
+                }
+                failure {
+                    echo "--------- Build failed ----------"
+                }
+            }
+        }
+        stage("Code analysis with checkstyle") {
+            steps {
+                script {
+                    echo "Running Checkstyle"
+                    try {
+                        sh 'mvn checkstyle:checkstyle'
+                        def reportfile = 'target/checkstyle-result.xml'
+                        if (fileExists(reportfile)) {
+                            echo 'Checkstyle Report Found'
+                        } else {
+                            echo "Checkstyle Report Not Found"
+                        }
+                    } catch (e) {
+                        echo "Checkstyle execution failed, but continuing..."
+                    }
+                }
+            }
+        }
+        stage("Code analysis with sonarqube") {
+            steps {
+                script {
+                    withSonarQubeEnv("sonar_chd") {
+                        def scannerHome = tool 'sonarscannertool'
+                        sh """${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=Davproject \
+                            -Dsonar.projectName=Davproject-repo \
+                            -Dsonar.projectVersion=1.0 \
+                            -Dsonar.sources=src/ \
+                            -Dsonar.java.binaries=target/classes \
+                            -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                            -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+        stage('Quality Gate') {
+            steps {
+                script {
+                    timeout(time: 2, unit: 'MINUTES') {
+                        def qualityGate = waitForQualityGate()
+                        if (qualityGate.status != 'OK') {
+                            error "Quality gate failed: ${qualityGate.status}"
+                        } else {
+                            echo "Quality Gate passed!"
+                        }
+                    }
+                }
+            }
+        }
+        stage("Publish To Nexus") {
+            steps {
+                script {
+                    def groupId = sh(returnStdout: true, script: "mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout").trim()
+                    def artifactId = sh(returnStdout: true, script: "mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout").trim()
+                    
+                    nexusArtifactUploader(
+                        nexusVersion: NEXUS_VERSION,
+                        protocol: NEXUS_PROTOCOL,
+                        nexusUrl: NEXUS_URL,
+                        groupId: groupId, 
+                        version: ARTVERSION,
+                        repository: NEXUS_REPOSITORY,
+                        credentialsId: NEXUS_CREDENTIALS_ID,
+                        artifacts: [
+                            [ artifactId: artifactId, classifier: '', file: 'target/ROOT.war', type: 'war' ],
+                            [ artifactId: artifactId, classifier: '', file: 'pom.xml', type: "pom" ]
+                        ]
+                    )
+                }
+            }
+        }
+        stage("Build App Image")
+        {
+            steps
+            {
+                script
+                {
+                    dockerImage=docker.build(imageName + ":$BUILD_NUMBER","./Docker-files/app/multistage/")
+                }
+            }
+        }
+        stage("upload Docker App Image in AWS ECR")
+        {
+            steps
+            {
+                script
+                {
+                    docker.withRegistry(vprofileRegistry,registryCredential)
+                    {
+                        dockerImage.push("$BUILD_NUMBER")
+                        dockerImage.push('latest')
+                    }
+                }
+            }
+        }
+        stage("deploy to ecs")
+        {
+            steps
+            {
+                withAWS(credentials:'aws-creds',region:'ap-south-1')
+                {
+                    sh 'aws ecs update-service --cluster ${cluster} --service ${service} --force-new-deployment'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline finished"
+            echo "Sending Slack Notification..."
+            slackSend(
+                channel: '#all-pipelinestatus',
+                color: COLOR_MAP[currentBuild.currentResult] ?: 'danger',
+                message: "Status of Pipeline is ${currentBuild.currentResult ?: 'UNKNOWN'}\nJob: '${env.JOB_NAME}' Build #${env.BUILD_NUMBER}\nMore Info At: ${env.BUILD_URL}"
+            )
+        }
+    }
+}
+
